@@ -1,0 +1,10 @@
+__pycache__/
+*test*
+notebook/
+.ruff_cache/
+checkpoints*
+gla/
+logs/
+*.pth
+*.ipynb
+arch

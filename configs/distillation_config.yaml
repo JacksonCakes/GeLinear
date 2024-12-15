@@ -1,0 +1,31 @@
+data:
+  dataset_path: "/home/jackson/LLaMA-Factory/notebook/cache/allenai___tulu-3-sft-mixture"
+  tokenizer_path: "/tmp2/share_data/google-gemma-9b-it"
+  split_ratio: 0.1
+  subset: "train[:400000]"
+  remove_columns_from_train: true
+
+model:
+  shards:
+    - 1
+    - 2
+    - 3
+    - 4
+  file_pattern: "/tmp2/share_data/google-gemma-9b-it/model-0000{shard_num}-of-00004.safetensors"
+  device: "cuda:0"
+  checkpoint_dir: "./checkpoints_5to10"
+
+training:
+  lr: 1e-4
+  num_epochs: 3
+  save_interval: 10000
+  eval_interval: 50000
+  feature_dim: 64
+  feature_maps: 5
+  layer_slice:
+    outer_slice: [1, null, 2]  # equivalent to [1::2]
+    inner_slice: [5, 10]       # equivalent to [5:10]
+
+logging:
+  log_dir: "./logs"
+  level: "INFO"

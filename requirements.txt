@@ -1,0 +1,5 @@
+torch==2.5.1
+numpy==2.2.0
+datasets==3.2.0
+transformers==4.47.0
+tensorboard==2.18.0
