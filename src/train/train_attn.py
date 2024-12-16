@@ -81,6 +81,7 @@ def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slice
 
 def save_checkpoint(step, feature_map_model, directory, filename_prefix, **kwargs):
     save_path = os.path.join(directory, f"{filename_prefix}_step_{step}.pt")
+    os.makedirs(directory,exist_ok=True)
     checkpoint = {
         "step": step,
         "feature_map_model_state_dict": feature_map_model.state_dict(),
