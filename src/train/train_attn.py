@@ -55,15 +55,13 @@ def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slice
             with torch.no_grad():
                 outputs = model(input_ids, output_attn=True)
             outputs = outputs["all_outputs"]
-
-            zipped_outputs = list(
-                zip(
-                    outputs["all_query"],
-                    outputs["all_key"],
-                    outputs["all_attn"],
-                    outputs["all_mask"],
-                )
-            )[outer_slice][inner_slice]
+            outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
+            zipped_outputs = zip(
+                outputs["all_query"][outer_slice][inner_slice],
+                outputs["all_key"][outer_slice][inner_slice],
+                outputs["all_attn"][outer_slice][inner_slice],
+                outputs["all_mask"][outer_slice][inner_slice],
+            )
 
             for idx, (q, k, a_true, mask) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, layer_idx=idx)
@@ -73,6 +71,9 @@ def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slice
                 )
                 a_pred = a_pred.masked_fill(causal_mask, 0)
                 total_loss += mse_loss(a_pred, a_true).item()
+                del q, k, a_true, mask, a_pred
+
+            del outputs, zipped_outputs
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(val_loader)
@@ -125,35 +126,37 @@ def train(model, feature_map_model, train_loader, val_loader, device, config_par
             with torch.no_grad():
                 outputs = model(input_ids, output_attn=True)
             outputs = outputs["all_outputs"]
+            outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
 
             optimizer.zero_grad()
 
-            zipped_outputs = list(
-                zip(
-                    outputs["all_query"],
-                    outputs["all_key"],
-                    outputs["all_attn"],
-                    outputs["all_mask"],
-                )
-            )[outer_slice][inner_slice]
-
+            zipped_outputs = zip(
+                outputs["all_query"][outer_slice][inner_slice],
+                outputs["all_key"][outer_slice][inner_slice],
+                outputs["all_attn"][outer_slice][inner_slice],
+                outputs["all_mask"][outer_slice][inner_slice],
+            )
+            
+            causal_mask = None
             total_loss = 0.0
             for layer_idx, (q, k, a_true, mask) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, layer_idx=layer_idx)
                 m, n = a_pred.shape[-2:]
-                causal_mask = torch.ones((m, n), device=device, dtype=torch.bool).triu(
-                    n - m + 1
-                )
+                if causal_mask is None or causal_mask.shape != (m, n):
+                    causal_mask = torch.ones((m, n), device=device, dtype=torch.bool).triu(n - m + 1)       
                 a_pred = a_pred.masked_fill(causal_mask, 0)
                 layer_loss = mse_loss(a_pred, a_true)
                 total_loss += layer_loss
+                del q, k, a_true, mask, a_pred
 
             total_loss.backward()
             optimizer.step()
 
             total_train_loss += total_loss.item()
-            torch.cuda.empty_cache()
-
+            del outputs, zipped_outputs, total_loss
+            
+            if step % 100 == 0:
+                torch.cuda.empty_cache()
             if step % eval_interval == 0:
                 val_loss = evaluate(
                     model, feature_map_model, val_loader, device, mse_loss, layer_slices
