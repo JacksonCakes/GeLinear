@@ -52,6 +52,7 @@ class TrainableHedgehog(nn.Module):
         self, num_feature_maps, num_heads, head_dim, feature_dim
     ):  # , dtype, device):
         super(TrainableHedgehog, self).__init__()
+        self.scaling_factor = head_dim**-0.5
         self.feature_maps_q = nn.ModuleList(
             [
                 HedgehogFeatureMap(
