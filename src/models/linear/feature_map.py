@@ -73,9 +73,17 @@ class TrainableHedgehog(nn.Module):
             ]
         )
 
-    def forward(self, q, k, layer_idx):
+    def forward(self, q, k, v, layer_idx, eps=1e-12):
         # Forward pass for a specific layer
         phi_q = self.feature_maps_q[layer_idx](q)
         phi_k = self.feature_maps_k[layer_idx](k)
         a = torch.einsum("bhmd,bhnd->bhmn", phi_q, phi_k)
-        return a
+        m, n = a.shape[-2:]
+        causal_mask = torch.ones((m, n), device=a.device, dtype=torch.bool).triu(
+            n - m + 1
+        )
+        a_pred = a.masked_fill(causal_mask, 0)
+        # Normalize attention scores
+        a_pred = a_pred / (a_pred.sum(dim=-1, keepdim=True) + eps)
+        out_pred = torch.einsum("bhmn,bhnd->bhmd", a_pred, v)
+        return out_pred

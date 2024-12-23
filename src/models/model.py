@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.rope import RotaryEmbedding, apply_rotary_emb
-from typing import Union, Tuple, Optional
+from typing import Union, Tuple, Optional, Iterator
 
 
 def create_casual_mask(seq_len, device):
@@ -55,7 +55,9 @@ class GemmaAttention(nn.Module):
         self.sliding_window_size = sliding_window_size
         self.attn_logit_softcapping = attn_logit_softcapping
 
-    def forward(self, hidden_states, freqs_cis, mask, output_attn):
+    def forward(
+        self, hidden_states, freqs_cis, mask, output_attn, train_full_attn=True
+    ):
         batch_size, seq_len, dim = hidden_states.shape
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -97,17 +99,20 @@ class GemmaAttention(nn.Module):
         scores = qk + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
         # [batch_size, num_heads, seq_len, head_dim]
-        output = torch.einsum("BHSF,BHFD->BHSD", scores, v)
-        output = output.transpose(1, 2).contiguous()
+        attn_output = torch.einsum("BHSF,BHFD->BHSD", scores, v)
+        output = attn_output.transpose(1, 2).contiguous()
         output = self.o_proj(output.reshape(batch_size, seq_len, -1))
         if output_attn:
-            return {
+            outputs = {
                 "hidden_states": output,
                 "attentions": scores,
                 "query": q,
                 "key": k,
-                "mask": mask,
+                "value": v,
             }
+            if train_full_attn:
+                outputs["attentions"] = attn_output
+            return outputs
         return {"hidden_states": output}
 
 
@@ -212,7 +217,7 @@ class GemmaDecoderLayer(nn.Module):
                 "attentions": outputs["attentions"],
                 "query": outputs["query"],
                 "key": outputs["key"],
-                "mask": outputs["mask"],
+                "value": outputs["value"],
             }
         return {"hidden_states": hidden_states}
 
@@ -244,7 +249,7 @@ class GemmaModel(nn.Module):
             "all_query": [],
             "all_key": [],
             "all_hs": [],
-            "all_mask": [],
+            "all_value": [],
         }
 
         for layer in self.decoder_layers:
@@ -260,7 +265,7 @@ class GemmaModel(nn.Module):
                 all_outputs["all_query"].append(outputs["query"])
                 all_outputs["all_key"].append(outputs["key"])
                 all_outputs["all_hs"].append(outputs["hidden_states"])
-                all_outputs["all_mask"].append(outputs["mask"])
+                all_outputs["all_value"].append(outputs["value"])
 
         hidden_states = self.norm(hidden_states)
         return {"hidden_states": hidden_states, "all_outputs": all_outputs}
@@ -370,7 +375,8 @@ class GemmaForCausalLM(nn.Module):
         temperature: Union[float, None] = 0,
         top_p: float = 1.0,
         top_k: int = 100,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        eos_token_id: int = 107,
+    ) -> Iterator[torch.Tensor]:
         batch_size = input_token_ids_tensor.shape[0]
         device = input_token_ids_tensor.device
         temperatures_tensor = (
@@ -380,6 +386,7 @@ class GemmaForCausalLM(nn.Module):
         )
         top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
         top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+
         for i in range(output_len):
             next_token_ids, _ = self.sampling(
                 input_ids=input_token_ids_tensor,
@@ -390,7 +397,9 @@ class GemmaForCausalLM(nn.Module):
             input_token_ids_tensor = torch.cat(
                 [input_token_ids_tensor, next_token_ids.unsqueeze(1)], dim=1
             )
-        return input_token_ids_tensor
+            if next_token_ids[0] == eos_token_id:
+                break
+            yield next_token_ids
 
     def load_weights(self, state_dict):
         key_mapping = {

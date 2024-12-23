@@ -37,7 +37,15 @@ def load_full_state_dict(shards, pattern):
     return state_dict
 
 
-def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slices):
+def evaluate(
+    model,
+    feature_map_model,
+    val_loader,
+    device,
+    mse_loss,
+    layer_slices,
+    mse_factor=1000,
+):
     model.eval()
     feature_map_model.eval()
     total_loss = 0.0
@@ -59,19 +67,17 @@ def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slice
             zipped_outputs = zip(
                 outputs["all_query"][outer_slice][inner_slice],
                 outputs["all_key"][outer_slice][inner_slice],
+                outputs["all_value"][outer_slice][inner_slice],
                 outputs["all_attn"][outer_slice][inner_slice],
-                outputs["all_mask"][outer_slice][inner_slice],
             )
 
-            for idx, (q, k, a_true, mask) in enumerate(zipped_outputs):
-                a_pred = feature_map_model(q=q, k=k, layer_idx=idx)
-                m, n = a_pred.shape[-2:]
-                causal_mask = torch.ones((m, n), device=device, dtype=torch.bool).triu(
-                    n - m + 1
-                )
-                a_pred = a_pred.masked_fill(causal_mask, 0)
-                total_loss += mse_loss(a_pred, a_true).item()
-                del q, k, a_true, mask, a_pred
+            n_layers = len(outputs["all_query"][outer_slice][inner_slice])
+            for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
+                a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
+                layer_loss = mse_loss(a_pred, a_true)
+                total_loss += layer_loss
+                del q, k, v, a_true, a_pred
+            total_loss = total_loss / n_layers * mse_factor
 
             del outputs, zipped_outputs
             torch.cuda.empty_cache()
@@ -82,7 +88,7 @@ def evaluate(model, feature_map_model, val_loader, device, mse_loss, layer_slice
 
 def save_checkpoint(step, feature_map_model, directory, filename_prefix, **kwargs):
     save_path = os.path.join(directory, f"{filename_prefix}_step_{step}.pt")
-    os.makedirs(directory,exist_ok=True)
+    os.makedirs(directory, exist_ok=True)
     checkpoint = {
         "step": step,
         "feature_map_model_state_dict": feature_map_model.state_dict(),
@@ -92,12 +98,20 @@ def save_checkpoint(step, feature_map_model, directory, filename_prefix, **kwarg
     logging.info(f"Checkpoint saved at step {step} to {save_path}")
 
 
-def train(model, feature_map_model, train_loader, val_loader, device, config_params):
+def train(
+    model,
+    feature_map_model,
+    train_loader,
+    val_loader,
+    device,
+    config_params,
+    mse_factor=1000,
+):
     optimizer = torch.optim.AdamW(
         [p for p in feature_map_model.parameters() if p.requires_grad],
         lr=float(config_params["training"]["lr"]),
     )
-    mse_loss = nn.MSELoss()
+    mse_loss = nn.MSELoss(reduction="mean")
 
     num_epochs = config_params["training"]["num_epochs"]
     save_interval = config_params["training"]["save_interval"]
@@ -133,28 +147,24 @@ def train(model, feature_map_model, train_loader, val_loader, device, config_par
             zipped_outputs = zip(
                 outputs["all_query"][outer_slice][inner_slice],
                 outputs["all_key"][outer_slice][inner_slice],
+                outputs["all_value"][outer_slice][inner_slice],
                 outputs["all_attn"][outer_slice][inner_slice],
-                outputs["all_mask"][outer_slice][inner_slice],
             )
-            
-            causal_mask = None
+
             total_loss = 0.0
-            for layer_idx, (q, k, a_true, mask) in enumerate(zipped_outputs):
-                a_pred = feature_map_model(q=q, k=k, layer_idx=layer_idx)
-                m, n = a_pred.shape[-2:]
-                if causal_mask is None or causal_mask.shape != (m, n):
-                    causal_mask = torch.ones((m, n), device=device, dtype=torch.bool).triu(n - m + 1)       
-                a_pred = a_pred.masked_fill(causal_mask, 0)
+            n_layers = len(outputs["all_query"][outer_slice][inner_slice])
+            for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
+                a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
                 layer_loss = mse_loss(a_pred, a_true)
                 total_loss += layer_loss
-                del q, k, a_true, mask, a_pred
-
+                del q, k, v, a_true, a_pred
+            total_loss = total_loss / n_layers * mse_factor
             total_loss.backward()
             optimizer.step()
 
             total_train_loss += total_loss.item()
             del outputs, zipped_outputs, total_loss
-            
+
             if step % 100 == 0:
                 torch.cuda.empty_cache()
             if step % eval_interval == 0:
