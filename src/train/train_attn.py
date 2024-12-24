@@ -46,7 +46,6 @@ def evaluate(
     layer_slices,
     mse_factor=1000,
 ):
-    model.eval()
     feature_map_model.eval()
     total_loss = 0.0
 
@@ -70,15 +69,16 @@ def evaluate(
                 outputs["all_value"][outer_slice][inner_slice],
                 outputs["all_attn"][outer_slice][inner_slice],
             )
-
+            batch_loss = 0.0
             n_layers = len(outputs["all_query"][outer_slice][inner_slice])
+            print(f"N layers eval: {n_layers}")
             for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
                 layer_loss = mse_loss(a_pred, a_true)
-                total_loss += layer_loss
+                batch_loss += layer_loss
                 del q, k, v, a_true, a_pred
-            total_loss = total_loss / n_layers * mse_factor
-
+            batch_loss = batch_loss / n_layers * mse_factor
+            total_loss += batch_loss
             del outputs, zipped_outputs
             torch.cuda.empty_cache()
 
@@ -128,7 +128,6 @@ def train(
     lowest_val_loss = float("inf")
 
     for epoch in range(num_epochs):
-        feature_map_model.train()
         total_train_loss = 0.0
 
         for batch in tqdm(
@@ -153,6 +152,7 @@ def train(
 
             total_loss = 0.0
             n_layers = len(outputs["all_query"][outer_slice][inner_slice])
+            print(f"N layers: {n_layers}")
             for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
                 layer_loss = mse_loss(a_pred, a_true)
@@ -186,9 +186,7 @@ def train(
                     logging.info(f"New best validation loss: {val_loss:.3f}")
 
             if step % save_interval == 0:
-                avg_train_loss_so_far = total_train_loss / (
-                    (step % len(train_loader)) or len(train_loader)
-                )
+                avg_train_loss_so_far = total_train_loss / step
                 save_checkpoint(
                     step,
                     feature_map_model,
@@ -197,9 +195,10 @@ def train(
                     train_loss=avg_train_loss_so_far,
                 )
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        logging.info(f"Epoch {epoch+1} - Training Loss: {avg_train_loss:.3f}")
-        writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+                logging.info(
+                    f"Step {step+1} - Training Loss: {avg_train_loss_so_far:.3f}"
+                )
+                writer.add_scalar("Loss/Train", avg_train_loss_so_far, step + 1)
 
     writer.close()
 
