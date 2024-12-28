@@ -8,3 +8,6 @@ logs/
 *.pth
 *.ipynb
 arch
+*.txt
+*.pt
+.vscode

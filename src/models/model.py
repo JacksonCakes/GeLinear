@@ -1,9 +1,9 @@
-import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.rope import RotaryEmbedding, apply_rotary_emb
 from typing import Union, Tuple, Optional, Iterator
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 
 def create_casual_mask(seq_len, device):
@@ -116,7 +116,7 @@ class GemmaAttention(nn.Module):
         return {"hidden_states": output}
 
 
-class Gemma2MLP(nn.Module):
+class GemmaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -166,7 +166,7 @@ class RMSNorm(torch.nn.Module):
 class GemmaDecoderLayer(nn.Module):
     def __init__(self, config, attention_type):
         super().__init__()
-        self.attention = GemmaAttention(
+        self.self_attn = GemmaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -175,7 +175,7 @@ class GemmaDecoderLayer(nn.Module):
             attn_type=attention_type,
             sliding_window_size=config.sliding_window_size,
         )
-        self.mlp = Gemma2MLP(config=config)
+        self.mlp = GemmaMLP(config=config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -197,7 +197,7 @@ class GemmaDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        outputs = self.attention(
+        outputs = self.self_attn(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             mask=mask,
@@ -226,8 +226,12 @@ class GemmaModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        vocab_size = config.vocab_size
+        padding_idx = config.padding_idx
+        self.hidden_size = config.hidden_size
+        self.embed_tokens = nn.Embedding(vocab_size, self.hidden_size, padding_idx)
         num_hidden_layers = config.num_hidden_layers
-        self.decoder_layers = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
                 GemmaDecoderLayer(
                     config=config, attention_type=config.attention_type[i]
@@ -239,7 +243,7 @@ class GemmaModel(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: torch.Tensor,
         output_attn: Optional[bool],
@@ -251,8 +255,13 @@ class GemmaModel(nn.Module):
             "all_hs": [],
             "all_value": [],
         }
-
-        for layer in self.decoder_layers:
+        embeddings = self.embed_tokens(input_ids)
+        # Gemma normalizes the embedding by sqrt(hidden_size).
+        # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
+        # See https://github.com/huggingface/transformers/pull/29402
+        normalizer = torch.tensor(self.hidden_size**0.5, dtype=embeddings.dtype)
+        hidden_states = embeddings * normalizer
+        for layer in self.layers:
             outputs = layer(
                 hidden_states=hidden_states,
                 freqs_cis=freqs_cis,
@@ -277,16 +286,18 @@ class GemmaForCausalLM(nn.Module):
         self.config = config
         self.max_seq_len = config.max_position_embeddings
         self.hidden_size = config.hidden_size
-        vocab_size = config.vocab_size
-        padding_idx = config.padding_idx
         num_attention_heads = config.num_attention_heads
         assert self.hidden_size % num_attention_heads == 0, (
             f"hidden_size ({self.hidden_size}) must be divisible by "
             f"num_attention_heads ({num_attention_heads})."
         )
-        self.embedding_layer = nn.Embedding(vocab_size, self.hidden_size, padding_idx)
+
         self.model = GemmaModel(config=config)
-        self.lm_head = nn.Linear(self.hidden_size, vocab_size, bias=False)
+        self.rope_embeddings = RotaryEmbedding(
+            theta=config.rope_theta,
+            head_dim=config.head_dim,
+            max_seq_len=self.max_seq_len,
+        )
         self.rope_embeddings = RotaryEmbedding(
             theta=config.rope_theta,
             head_dim=config.head_dim,
@@ -303,16 +314,10 @@ class GemmaForCausalLM(nn.Module):
     ):
         seq_len = input_ids.shape[1]
         freqs_cis = self.rope_embeddings(seq_len=seq_len, tok_idx=tok_idx)
-        embeddings = self.embedding_layer(input_ids)
-        # Gemma normalizes the embedding by sqrt(hidden_size).
-        # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
-        # See https://github.com/huggingface/transformers/pull/29402
-        normalizer = torch.tensor(self.hidden_size**0.5, dtype=embeddings.dtype)
-        hidden_states = embeddings * normalizer
         if mask is None:
             mask = create_casual_mask(seq_len, device=input_ids.device)
         outputs = self.model(
-            hidden_states=hidden_states,
+            input_ids=input_ids,
             freqs_cis=freqs_cis,
             mask=mask,
             output_attn=output_attn,
@@ -320,7 +325,10 @@ class GemmaForCausalLM(nn.Module):
         hidden_states = outputs["hidden_states"]
         if output_attn:
             return outputs
-        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        # equivalent to lm_head() but since its tied weights, we can just use F.linear
+        logits = F.linear(
+            hidden_states[:, -num_logits_to_keep:, :], self.model.embed_tokens.weight
+        )
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
@@ -401,21 +409,24 @@ class GemmaForCausalLM(nn.Module):
                 break
             yield next_token_ids
 
-    def load_weights(self, state_dict):
-        key_mapping = {
-            "model.embed_tokens": "embedding_layer",
-            "layers": "decoder_layers",
-            "self_attn": "attention",
-        }
-        keys_to_update = list(state_dict.keys())
-        for old_key in keys_to_update:
-            new_key = old_key
-            for old_substring, new_substring in key_mapping.items():
-                new_key = new_key.replace(old_substring, new_substring)
-            if new_key != old_key:
-                state_dict[new_key] = state_dict.pop(old_key)
-        self.load_state_dict(state_dict, strict=False)
-        del state_dict  # save memory.
-        gc.collect()
-        # tied embedding weight
-        self.lm_head.weight = self.embedding_layer.weight
+    @classmethod
+    def from_pretrained(
+        cls,
+        config,
+        checkpoint_path,
+        device_map="sequential",
+        dtype=torch.bfloat16,
+        strict=False,
+    ):
+        # some form of lazy loading
+        with init_empty_weights():
+            model = cls(config)
+
+        model = load_checkpoint_and_dispatch(
+            model,
+            checkpoint=checkpoint_path,
+            device_map=device_map,
+            dtype=dtype,
+            strict=strict,
+        )
+        return model

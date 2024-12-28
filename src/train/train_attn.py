@@ -1,7 +1,6 @@
 import argparse
 import os
 import logging
-import contextlib
 import yaml
 
 import torch
@@ -10,31 +9,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
-from safetensors.torch import load_file
 from tqdm import tqdm
 
 from src.models.model_config import get_model_config
 from src.models.model import GemmaForCausalLM
 from src.dataloaders.loader import load_data
 from src.models.linear.feature_map import TrainableHedgehog
-
-
-@contextlib.contextmanager
-def _set_default_dtype(dtype: torch.dtype):
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-
-def load_full_state_dict(shards, pattern):
-    state_dict = {}
-    for shard in shards:
-        shard_file = pattern.format(shard_num=str(shard))
-        state_dict.update(load_file(shard_file))
-    return state_dict
 
 
 def evaluate(
@@ -71,7 +51,6 @@ def evaluate(
             )
             batch_loss = 0.0
             n_layers = len(outputs["all_query"][outer_slice][inner_slice])
-            print(f"N layers eval: {n_layers}")
             for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
                 layer_loss = mse_loss(a_pred, a_true)
@@ -111,6 +90,13 @@ def train(
         [p for p in feature_map_model.parameters() if p.requires_grad],
         lr=float(config_params["training"]["lr"]),
     )
+    num_trainable_params = sum(
+        p.numel() for p in feature_map_model.parameters() if p.requires_grad
+    )
+    params_in_millions = num_trainable_params / 1e6
+
+    print(f"Number of trainable parameters: {params_in_millions:.2f}M")
+
     mse_loss = nn.MSELoss(reduction="mean")
 
     num_epochs = config_params["training"]["num_epochs"]
@@ -152,7 +138,6 @@ def train(
 
             total_loss = 0.0
             n_layers = len(outputs["all_query"][outer_slice][inner_slice])
-            print(f"N layers: {n_layers}")
             for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
                 a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
                 layer_loss = mse_loss(a_pred, a_true)
@@ -221,23 +206,24 @@ if __name__ == "__main__":
     # disable_caching()
 
     writer = SummaryWriter(log_dir=config_params["logging"]["log_dir"])
-
+    model_path = config_params["model"]["model_path"]
     model_config = get_model_config()
-    state_dict = load_full_state_dict(
-        config_params["model"]["shards"], config_params["model"]["file_pattern"]
+    model_dtype = model_config.get_dtype()
+    model = GemmaForCausalLM.from_pretrained(
+        config=model_config,
+        checkpoint_path=model_path,
+        device_map="sequential",
+        dtype=model_dtype,
+        strict=False,
     )
+    model.eval()
 
-    with _set_default_dtype(model_config.get_dtype()):
-        model = GemmaForCausalLM(model_config)
-        model.load_weights(state_dict)
-        model = model.to(config_params["model"]["device"]).eval()
-
-        feature_map_model = TrainableHedgehog(
-            num_feature_maps=config_params["training"]["feature_maps"],
-            num_heads=model_config.num_attention_heads,
-            head_dim=model_config.head_dim,
-            feature_dim=config_params["training"]["feature_dim"],
-        ).to(config_params["model"]["device"])
+    feature_map_model = TrainableHedgehog(
+        num_feature_maps=config_params["training"]["feature_maps"],
+        num_heads=model_config.num_attention_heads,
+        head_dim=model_config.head_dim,
+        feature_dim=config_params["training"]["feature_dim"],
+    ).to(config_params["model"]["device"], dtype=model_dtype)
 
     dataset = load_dataset(
         config_params["data"]["dataset_path"], split=config_params["data"]["subset"]

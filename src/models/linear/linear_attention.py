@@ -118,7 +118,6 @@ class GemmaLinearAttention(nn.Module):
         v = v.transpose(1, 2)
         q = self.feature_map_q(q)
         k = self.feature_map_k(k)
-
         output = chunk_linear_attn(q, k, v)
         output = (
             output.transpose(1, 2)
