@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.rope import RotaryEmbedding, apply_rotary_emb
-from typing import Union, Tuple, Optional, Iterator
+from src.models.linear.feature_map import HedgehogFeatureMap
+from src.models.attentions import softmax_attention, quadratic_attention
+from typing import Union, Tuple, Iterator
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 
@@ -23,8 +25,11 @@ class GemmaAttention(nn.Module):
         head_dim,
         attn_type,
         sliding_window_size,
+        train_attn=False,
+        feature_dim=64,
     ):
         super().__init__()
+        self.hidden_size = hidden_size
         self.q_proj = nn.Linear(
             hidden_size,
             num_heads * head_dim,
@@ -46,6 +51,18 @@ class GemmaAttention(nn.Module):
             hidden_size,
             bias=False,
         )
+        self.train_attn = train_attn
+        if self.train_attn:
+            self.feature_map_q = HedgehogFeatureMap(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                feature_dim=feature_dim,
+            )
+            self.feature_map_k = HedgehogFeatureMap(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                feature_dim=feature_dim,
+            )
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scaling_factor = head_dim**-0.5
@@ -56,7 +73,10 @@ class GemmaAttention(nn.Module):
         self.attn_logit_softcapping = attn_logit_softcapping
 
     def forward(
-        self, hidden_states, freqs_cis, mask, output_attn, train_full_attn=True
+        self,
+        hidden_states,
+        freqs_cis,
+        mask,
     ):
         batch_size, seq_len, dim = hidden_states.shape
         q = self.q_proj(hidden_states)
@@ -80,8 +100,7 @@ class GemmaAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        qk = torch.einsum("BHSD,BHFD->BHSF", q, k)
-        qk.mul_(self.scaling_factor)
+
         # construct causal or sliding window mask to prevent
         # query to attend to keys outside the boundary
         if self.attn_type == "local":
@@ -90,30 +109,33 @@ class GemmaAttention(nn.Module):
                 all_ones, 1 - self.sliding_window_size
             ) * torch.tril(all_ones, self.sliding_window_size - 1)
             mask = torch.where(sliding_mask == 1, mask, -2.3819763e38)
-        # logits ← soft_cap ∗ tanh(logits/soft_cap)
-        if self.attn_logit_softcapping is not None:
-            qk = qk / self.attn_logit_softcapping
-            qk = torch.tanh(qk)
-            qk = qk * self.attn_logit_softcapping
-
-        scores = qk + mask
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        # [batch_size, num_heads, seq_len, head_dim]
-        attn_output = torch.einsum("BHSF,BHFD->BHSD", scores, v)
-        output = attn_output.transpose(1, 2).contiguous()
-        output = self.o_proj(output.reshape(batch_size, seq_len, -1))
-        if output_attn:
-            outputs = {
+        attn_output, scores = softmax_attention(
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            attn_logit_softcapping=self.attn_logit_softcapping,
+            scaling_factor=self.scaling_factor,
+        )
+        output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.o_proj(output)
+        if self.train_attn:
+            q = self.feature_map_q(q)
+            k = self.feature_map_k(k)
+            attn_output_pred, scores_pred = quadratic_attention(q=q, k=k, v=v)
+            return {
                 "hidden_states": output,
-                "attentions": scores,
-                "query": q,
-                "key": k,
-                "value": v,
+                "attn_scores": scores,
+                "attn_scores_pred": scores_pred,
+                "attn_output": attn_output,
+                "attn_output_pred": attn_output_pred,
             }
-            if train_full_attn:
-                outputs["attentions"] = attn_output
-            return outputs
-        return {"hidden_states": output}
+
+        return {
+            "hidden_states": output,
+            "attn_scores": scores,
+            "attn_output": attn_output,
+        }
 
 
 class GemmaMLP(nn.Module):
@@ -193,7 +215,6 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: torch.Tensor,
-        output_attn: Optional[bool],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -201,7 +222,6 @@ class GemmaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             mask=mask,
-            output_attn=output_attn,
         )
         hidden_states = outputs["hidden_states"]
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -211,15 +231,8 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        if output_attn:
-            return {
-                "hidden_states": hidden_states,
-                "attentions": outputs["attentions"],
-                "query": outputs["query"],
-                "key": outputs["key"],
-                "value": outputs["value"],
-            }
-        return {"hidden_states": hidden_states}
+        outputs["hidden_states"] = hidden_states
+        return outputs
 
 
 class GemmaModel(nn.Module):
@@ -246,15 +259,8 @@ class GemmaModel(nn.Module):
         input_ids: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: torch.Tensor,
-        output_attn: Optional[bool],
     ) -> torch.Tensor:
-        all_outputs = {
-            "all_attn": [],
-            "all_query": [],
-            "all_key": [],
-            "all_hs": [],
-            "all_value": [],
-        }
+        all_outputs = {}
         embeddings = self.embed_tokens(input_ids)
         # Gemma normalizes the embedding by sqrt(hidden_size).
         # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
@@ -266,15 +272,12 @@ class GemmaModel(nn.Module):
                 hidden_states=hidden_states,
                 freqs_cis=freqs_cis,
                 mask=mask,
-                output_attn=output_attn,
             )
+
             hidden_states = outputs["hidden_states"]
-            if output_attn:
-                all_outputs["all_attn"].append(outputs["attentions"])
-                all_outputs["all_query"].append(outputs["query"])
-                all_outputs["all_key"].append(outputs["key"])
-                all_outputs["all_hs"].append(outputs["hidden_states"])
-                all_outputs["all_value"].append(outputs["value"])
+            for k, v in outputs.items():
+                all_outputs.setdefault(k, [])
+                all_outputs[k].append(v)
 
         hidden_states = self.norm(hidden_states)
         return {"hidden_states": hidden_states, "all_outputs": all_outputs}
@@ -298,11 +301,6 @@ class GemmaForCausalLM(nn.Module):
             head_dim=config.head_dim,
             max_seq_len=self.max_seq_len,
         )
-        self.rope_embeddings = RotaryEmbedding(
-            theta=config.rope_theta,
-            head_dim=config.head_dim,
-            max_seq_len=self.max_seq_len,
-        )
 
     def forward(
         self,
@@ -310,7 +308,7 @@ class GemmaForCausalLM(nn.Module):
         tok_idx=None,
         mask=None,
         num_logits_to_keep=0,
-        output_attn=False,
+        train_attn=False,
     ):
         seq_len = input_ids.shape[1]
         freqs_cis = self.rope_embeddings(seq_len=seq_len, tok_idx=tok_idx)
@@ -320,10 +318,9 @@ class GemmaForCausalLM(nn.Module):
             input_ids=input_ids,
             freqs_cis=freqs_cis,
             mask=mask,
-            output_attn=output_attn,
         )
         hidden_states = outputs["hidden_states"]
-        if output_attn:
+        if train_attn:
             return outputs
         # equivalent to lm_head() but since its tied weights, we can just use F.linear
         logits = F.linear(

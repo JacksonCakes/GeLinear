@@ -1,44 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from src.models.rope import apply_rotary_emb
 from src.models.linear.feature_map import HedgehogFeatureMap
-from einops import rearrange
-
-
-def pad(x, chunk_size=64):
-    T = x.shape[-2]
-    padded_seq_len = ceildiv(T, chunk_size) * chunk_size
-    if x.shape[-2] % chunk_size != 0:
-        x = F.pad(x, (0, 0, 0, padded_seq_len - T))
-
-    return x
-
-
-def ceildiv(a, b):
-    return -(a // -b)
-
-
-def chunk_linear_attn(q, k, v, chunk_size=64):
-    q, k, v = map(lambda x: pad(x), [q, k, v])
-    q = rearrange(q, "b h (n c) d -> b h n c d", c=chunk_size) * (q.shape[-1] ** -0.5)
-    k = rearrange(k, "b h (n c) d -> b h n c d", c=chunk_size)
-    v = rearrange(v, "b h (n c) d -> b h n c d", c=chunk_size)
-    kv = k.transpose(-1, -2) @ v
-    kv = kv.cumsum(2)
-    kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)
-    inter = q @ kv  # (b, h, n, c, d) @ (b, h, n, d, d) -> (b, h, n, c, d)
-    intra = (
-        (q @ k.transpose(-1, -2)).masked_fill_(
-            torch.triu(
-                torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device),
-                diagonal=1,
-            ),
-            0,
-        )
-    ) @ v
-    o = inter + intra
-    return rearrange(o, "b h n c d -> b h (n c) d")
+from src.models.model import GemmaModel, create_casual_mask
+from src.models.attentions import quadratic_attention, chunk_linear_attn
 
 
 class GemmaLinearAttention(nn.Module):
@@ -47,10 +12,9 @@ class GemmaLinearAttention(nn.Module):
         hidden_size,
         num_heads,
         num_kv_heads,
-        attn_logit_softcapping,
         head_dim,
-        attn_type,
-        sliding_window_size,
+        train_attn=False,
+        feature_dim=64,
     ):
         super().__init__()
         self.q_proj = nn.Linear(
@@ -77,23 +41,21 @@ class GemmaLinearAttention(nn.Module):
         self.feature_map_q = HedgehogFeatureMap(
             num_heads=num_heads,
             head_dim=head_dim,
-            feature_dim=64,
+            feature_dim=feature_dim,
         )
         self.feature_map_k = HedgehogFeatureMap(
             num_heads=num_heads,
             head_dim=head_dim,
-            feature_dim=64,
+            feature_dim=feature_dim,
         )
+        self.train_attn = train_attn
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scaling_factor = head_dim**-0.5
         self.num_kv_heads = num_kv_heads
         self.num_queries_per_group = self.num_heads // self.num_kv_heads
-        self.attn_type = attn_type
-        self.sliding_window_size = sliding_window_size
-        self.attn_logit_softcapping = attn_logit_softcapping
 
-    def forward(self, hidden_states, freqs_cis, mask, output_attn):
+    def forward(self, hidden_states, freqs_cis, mask):
         batch_size, seq_len, dim = hidden_states.shape
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -118,6 +80,20 @@ class GemmaLinearAttention(nn.Module):
         v = v.transpose(1, 2)
         q = self.feature_map_q(q)
         k = self.feature_map_k(k)
+        if self.train_attn:
+            attn_output_pred, scores_pred = quadratic_attention(q=q, k=k, v=v)
+            output = (
+                attn_output_pred.transpose(1, 2)
+                .contiguous()
+                .view(batch_size, seq_len, -1)
+            )
+            output = self.o_proj(output)
+            return {
+                "hidden_states": output,
+                "attn_scores_pred": scores_pred,
+                "attn_output_pred": attn_output_pred,
+            }
+
         output = chunk_linear_attn(q, k, v)
         output = (
             output.transpose(1, 2)
@@ -126,3 +102,55 @@ class GemmaLinearAttention(nn.Module):
         )
         output = self.o_proj(output)
         return {"hidden_states": output}
+
+
+class SubGemmaModel(nn.Module):
+    def __init__(self, original_model: GemmaModel, rope_embeddings, layer_idx: list):
+        super().__init__()
+        self.embed_tokens = original_model.embed_tokens
+        full_idx = list(range(layer_idx[0], layer_idx[-1] + 1))
+        if layer_idx[0] % 2 == 0 or layer_idx[-1] % 2 == 0:
+            raise ValueError(
+                "Both the first and last indices in layer_idx must be odd."
+            )
+        self.layers = nn.ModuleList([original_model.layers[i] for i in full_idx])
+        self.rope_embeddings = rope_embeddings
+        for idx, layer in enumerate(self.layers):
+            if idx % 2 == 0:
+                q_proj = layer.self_attn.q_proj
+                k_proj = layer.self_attn.k_proj
+                v_proj = layer.self_attn.v_proj
+                o_proj = layer.self_attn.o_proj
+                layer.self_attn = GemmaLinearAttention(
+                    hidden_size=layer.self_attn.hidden_size,
+                    num_heads=layer.self_attn.num_heads,
+                    num_kv_heads=layer.self_attn.num_kv_heads,
+                    head_dim=layer.self_attn.head_dim,
+                    train_attn=True,
+                )
+                layer.self_attn.q_proj = q_proj
+                layer.self_attn.k_proj = k_proj
+                layer.self_attn.v_proj = v_proj
+                layer.self_attn.o_proj = o_proj
+                layer.self_attn.feature_map_q.requires_grad = True
+                layer.self_attn.feature_map_k.requires_grad = True
+
+    def forward(self, hidden_states: torch.Tensor, mask=None) -> torch.Tensor:
+        all_outputs = {}
+        seq_len = hidden_states.shape[1]
+        freqs_cis = self.rope_embeddings(seq_len=seq_len, tok_idx=None)
+        if mask is None:
+            mask = create_casual_mask(seq_len, device=hidden_states.device)
+        for layer in self.layers:
+            outputs = layer(
+                hidden_states=hidden_states,
+                freqs_cis=freqs_cis,
+                mask=mask,
+            )
+
+            hidden_states = outputs["hidden_states"]
+            for k, v in outputs.items():
+                all_outputs.setdefault(k, [])
+                all_outputs[k].append(v)
+
+        return {"hidden_states": hidden_states, "all_outputs": all_outputs}

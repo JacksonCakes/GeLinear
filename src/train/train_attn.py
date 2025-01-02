@@ -14,7 +14,8 @@ from tqdm import tqdm
 from src.models.model_config import get_model_config
 from src.models.model import GemmaForCausalLM
 from src.dataloaders.loader import load_data
-from src.models.linear.feature_map import TrainableHedgehog
+from src.models.linear.linear_attention import SubGemmaModel
+from src.train.attention_hooks import AttentionHook
 
 
 def evaluate(
@@ -23,42 +24,35 @@ def evaluate(
     val_loader,
     device,
     mse_loss,
-    layer_slices,
     mse_factor=1000,
+    attention_hook=None,
 ):
     feature_map_model.eval()
     total_loss = 0.0
-
-    # unpack layer slicing configuration
-    # outer slice will take the odd layer (zero-indexed), since gemma is hybrid attention
-    # alternate between sliding window and global attention
-    # inner is the layer that we want to perform distillation
-    outer_slice = slice(*layer_slices["outer_slice"])
-    inner_slice = slice(*layer_slices["inner_slice"])
-
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating", unit="batch"):
             input_ids = batch["input_ids"].to(device)
             with torch.no_grad():
-                outputs = model(input_ids, output_attn=True)
+                outputs = model(input_ids, train_attn=True)
             outputs = outputs["all_outputs"]
             outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
-            zipped_outputs = zip(
-                outputs["all_query"][outer_slice][inner_slice],
-                outputs["all_key"][outer_slice][inner_slice],
-                outputs["all_value"][outer_slice][inner_slice],
-                outputs["all_attn"][outer_slice][inner_slice],
-            )
+            for layer_name, tensors in attention_hook.captured_tensors.items():
+                hs = tensors["hidden_states"]
+            outputs_pred = feature_map_model(hs)["all_outputs"]
             batch_loss = 0.0
-            n_layers = len(outputs["all_query"][outer_slice][inner_slice])
-            for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
-                a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
-                layer_loss = mse_loss(a_pred, a_true)
+            zipped_outputs = list(
+                zip(outputs["attn_scores"], outputs_pred["attn_scores_pred"])
+            )
+            n_layers = len(zipped_outputs)
+            for attn_scores, attn_scores_pred in zipped_outputs:
+                layer_loss = mse_loss(attn_scores_pred, attn_scores)
                 batch_loss += layer_loss
-                del q, k, v, a_true, a_pred
+                del attn_scores, attn_scores_pred
             batch_loss = batch_loss / n_layers * mse_factor
             total_loss += batch_loss
-            del outputs, zipped_outputs
+            batch_loss = 0.0
+
+            del outputs, outputs_pred, zipped_outputs
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(val_loader)
@@ -68,9 +62,12 @@ def evaluate(
 def save_checkpoint(step, feature_map_model, directory, filename_prefix, **kwargs):
     save_path = os.path.join(directory, f"{filename_prefix}_step_{step}.pt")
     os.makedirs(directory, exist_ok=True)
+    filtered_state_dict = {
+        k: v for k, v in feature_map_model.state_dict().items() if "feature_map" in k
+    }
     checkpoint = {
         "step": step,
-        "feature_map_model_state_dict": feature_map_model.state_dict(),
+        "feature_map_model_state_dict": filtered_state_dict,
     }
     checkpoint.update(kwargs)
     torch.save(checkpoint, save_path)
@@ -84,6 +81,7 @@ def train(
     val_loader,
     device,
     config_params,
+    attention_hook=None,
     mse_factor=1000,
 ):
     optimizer = torch.optim.AdamW(
@@ -103,13 +101,6 @@ def train(
     save_interval = config_params["training"]["save_interval"]
     eval_interval = config_params["training"]["eval_interval"]
 
-    outer_slice = slice(*config_params["training"]["layer_slice"]["outer_slice"])
-    inner_slice = slice(*config_params["training"]["layer_slice"]["inner_slice"])
-    layer_slices = {
-        "outer_slice": config_params["training"]["layer_slice"]["outer_slice"],
-        "inner_slice": config_params["training"]["layer_slice"]["inner_slice"],
-    }
-
     step = 0
     lowest_val_loss = float("inf")
 
@@ -123,38 +114,40 @@ def train(
             input_ids = batch["input_ids"].to(device)
 
             with torch.no_grad():
-                outputs = model(input_ids, output_attn=True)
+                outputs = model(input_ids, train_attn=True)
             outputs = outputs["all_outputs"]
             outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
-
+            for layer_name, tensors in attention_hook.captured_tensors.items():
+                hs = tensors["hidden_states"]
+            outputs_pred = feature_map_model(hs)["all_outputs"]
             optimizer.zero_grad()
 
-            zipped_outputs = zip(
-                outputs["all_query"][outer_slice][inner_slice],
-                outputs["all_key"][outer_slice][inner_slice],
-                outputs["all_value"][outer_slice][inner_slice],
-                outputs["all_attn"][outer_slice][inner_slice],
-            )
-
             total_loss = 0.0
-            n_layers = len(outputs["all_query"][outer_slice][inner_slice])
-            for layer_idx, (q, k, v, a_true) in enumerate(zipped_outputs):
-                a_pred = feature_map_model(q=q, k=k, v=v, layer_idx=layer_idx)
-                layer_loss = mse_loss(a_pred, a_true)
+            zipped_outputs = list(
+                zip(outputs["attn_scores"], outputs_pred["attn_scores_pred"])
+            )
+            n_layers = len(zipped_outputs)
+            for attn_scores, attn_scores_pred in zipped_outputs:
+                layer_loss = mse_loss(attn_scores_pred, attn_scores)
                 total_loss += layer_loss
-                del q, k, v, a_true, a_pred
+                del attn_scores, attn_scores_pred
             total_loss = total_loss / n_layers * mse_factor
             total_loss.backward()
             optimizer.step()
 
             total_train_loss += total_loss.item()
-            del outputs, zipped_outputs, total_loss
+            del outputs, outputs_pred, zipped_outputs, total_loss
 
             if step % 100 == 0:
                 torch.cuda.empty_cache()
             if step % eval_interval == 0:
                 val_loss = evaluate(
-                    model, feature_map_model, val_loader, device, mse_loss, layer_slices
+                    model,
+                    feature_map_model,
+                    val_loader,
+                    device,
+                    mse_loss,
+                    attention_hook=attention_hook,
                 )
                 logging.info(f"Step {step} - Validation Loss: {val_loss:.3f}")
                 writer.add_scalar("Loss/Validation", val_loss, step)
@@ -209,6 +202,7 @@ if __name__ == "__main__":
     model_path = config_params["model"]["model_path"]
     model_config = get_model_config()
     model_dtype = model_config.get_dtype()
+    layer_idx = config_params["model"]["distill_layer_idx"]
     model = GemmaForCausalLM.from_pretrained(
         config=model_config,
         checkpoint_path=model_path,
@@ -217,14 +211,22 @@ if __name__ == "__main__":
         strict=False,
     )
     model.eval()
+    for name, param in model.named_parameters():
+        param.requires_grad = False
 
-    feature_map_model = TrainableHedgehog(
-        num_feature_maps=config_params["training"]["feature_maps"],
-        num_heads=model_config.num_attention_heads,
-        head_dim=model_config.head_dim,
-        feature_dim=config_params["training"]["feature_dim"],
+    feature_map_model = SubGemmaModel(
+        original_model=model.model,
+        rope_embeddings=model.rope_embeddings,
+        layer_idx=layer_idx,
     ).to(config_params["model"]["device"], dtype=model_dtype)
 
+    for name, param in feature_map_model.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: requires_grad = {param.requires_grad}")
+
+    attention_hook = AttentionHook()
+    layers_to_hook = [layer_idx[0] - 1]
+    attention_hook.register_hooks(model, layers_to_hook)
     dataset = load_dataset(
         config_params["data"]["dataset_path"], split=config_params["data"]["subset"]
     )
@@ -256,5 +258,6 @@ if __name__ == "__main__":
         train_loader=train_loader,
         val_loader=val_loader,
         device=config_params["model"]["device"],
+        attention_hook=attention_hook,
         config_params=config_params,
     )
