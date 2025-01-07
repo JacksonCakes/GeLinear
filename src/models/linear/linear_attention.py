@@ -121,6 +121,7 @@ class SubGemmaModel(nn.Module):
                 k_proj = layer.self_attn.k_proj
                 v_proj = layer.self_attn.v_proj
                 o_proj = layer.self_attn.o_proj
+
                 layer.self_attn = GemmaLinearAttention(
                     hidden_size=layer.self_attn.hidden_size,
                     num_heads=layer.self_attn.num_heads,

@@ -52,7 +52,7 @@ def evaluate(
             total_loss += batch_loss
             batch_loss = 0.0
 
-            del outputs, outputs_pred, zipped_outputs
+            del hs, outputs, outputs_pred, zipped_outputs
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(val_loader)
@@ -88,6 +88,10 @@ def train(
         [p for p in feature_map_model.parameters() if p.requires_grad],
         lr=float(config_params["training"]["lr"]),
     )
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=len(train_loader)
+    )
+
     num_trainable_params = sum(
         p.numel() for p in feature_map_model.parameters() if p.requires_grad
     )
@@ -103,7 +107,7 @@ def train(
 
     step = 0
     lowest_val_loss = float("inf")
-
+    n_batches_per_step = 64
     for epoch in range(num_epochs):
         total_train_loss = 0.0
 
@@ -112,7 +116,8 @@ def train(
         ):
             step += 1
             input_ids = batch["input_ids"].to(device)
-
+            if input_ids.shape[1] == 1024:
+                continue
             with torch.no_grad():
                 outputs = model(input_ids, train_attn=True)
             outputs = outputs["all_outputs"]
@@ -136,8 +141,9 @@ def train(
             optimizer.step()
 
             total_train_loss += total_loss.item()
-            del outputs, outputs_pred, zipped_outputs, total_loss
-
+            del hs, outputs, outputs_pred, zipped_outputs, total_loss
+            if step % n_batches_per_step == 0:
+                lr_scheduler.step()
             if step % 100 == 0:
                 torch.cuda.empty_cache()
             if step % eval_interval == 0:
@@ -174,9 +180,10 @@ def train(
                 )
 
                 logging.info(
-                    f"Step {step+1} - Training Loss: {avg_train_loss_so_far:.3f}"
+                    f"Step {step+1} - Training Loss: {avg_train_loss_so_far:.3f} - LR: {lr_scheduler.get_last_lr()[0]:.6f}"
                 )
                 writer.add_scalar("Loss/Train", avg_train_loss_so_far, step + 1)
+                writer.add_scalar("LR", lr_scheduler.get_last_lr()[0], step + 1)
 
     writer.close()
 
@@ -211,6 +218,7 @@ if __name__ == "__main__":
         strict=False,
     )
     model.eval()
+
     for name, param in model.named_parameters():
         param.requires_grad = False
 
@@ -223,7 +231,6 @@ if __name__ == "__main__":
     for name, param in feature_map_model.named_parameters():
         if param.requires_grad:
             print(f"{name}: requires_grad = {param.requires_grad}")
-
     attention_hook = AttentionHook()
     layers_to_hook = [layer_idx[0] - 1]
     attention_hook.register_hooks(model, layers_to_hook)
