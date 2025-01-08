@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+
 from src.models.rope import apply_rotary_emb
 from src.models.linear.feature_map import HedgehogFeatureMap
 from src.models.model import GemmaModel, create_casual_mask
@@ -136,20 +138,62 @@ class SubGemmaModel(nn.Module):
                 layer.self_attn.feature_map_q.requires_grad = True
                 layer.self_attn.feature_map_k.requires_grad = True
 
+    def forward_layer(self, layer, hidden_states, freqs_cis, mask):
+        """
+        A wrapper that calls `layer(...)` and returns
+        ONLY Tensor outputs so that we can checkpoint it.
+        """
+        outputs = layer(
+            hidden_states=hidden_states,
+            freqs_cis=freqs_cis,
+            mask=mask,
+        )
+        hidden_states_out = outputs["hidden_states"]
+        attn_scores_pred = outputs.get("attn_scores_pred", None)
+
+        # checkpointing must return tensors in a tuple.
+        return (hidden_states_out, attn_scores_pred)
+
     def forward(self, hidden_states: torch.Tensor, mask=None) -> torch.Tensor:
         all_outputs = {}
         seq_len = hidden_states.shape[1]
         freqs_cis = self.rope_embeddings(seq_len=seq_len, tok_idx=None)
         if mask is None:
             mask = create_casual_mask(seq_len, device=hidden_states.device)
-        for layer in self.layers:
-            outputs = layer(
-                hidden_states=hidden_states,
-                freqs_cis=freqs_cis,
-                mask=mask,
-            )
+        for idx, layer in enumerate(self.layers):
+            if idx % 2 == 0:
+                # ----------------------------------------
+                # GRADIENT CHECKPOINTING
+                # Instead of:
+                #   outputs = layer(hidden_states, freqs_cis, mask)
+                #
+                # do:
+                #   (hidden_states, attn_scores_pred) = checkpoint(...)
+                # ----------------------------------------
+                (hidden_states_out, attn_scores_pred) = checkpoint(
+                    self.forward_layer,
+                    layer,
+                    hidden_states,
+                    freqs_cis,
+                    mask,
+                    use_reentrant=False,
+                )
+                outputs = {
+                    "hidden_states": hidden_states_out,
+                }
+                if attn_scores_pred is not None:
+                    outputs["attn_scores_pred"] = attn_scores_pred
 
-            hidden_states = outputs["hidden_states"]
+                hidden_states = hidden_states_out
+            else:
+                outputs = layer(
+                    hidden_states=hidden_states,
+                    freqs_cis=freqs_cis,
+                    mask=mask,
+                )
+
+                hidden_states = outputs["hidden_states"]
+
             for k, v in outputs.items():
                 all_outputs.setdefault(k, [])
                 all_outputs[k].append(v)
