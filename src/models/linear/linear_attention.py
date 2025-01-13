@@ -4,7 +4,7 @@ from torch.utils.checkpoint import checkpoint
 
 from src.models.rope import apply_rotary_emb
 from src.models.linear.feature_map import HedgehogFeatureMap
-from src.models.model import GemmaModel, create_casual_mask
+from src.models.model import GemmaDecoderLayer, GemmaModel, create_casual_mask
 from src.models.attentions import quadratic_attention, chunk_linear_attn
 
 
@@ -96,7 +96,7 @@ class GemmaLinearAttention(nn.Module):
                 "attn_output_pred": attn_output_pred,
             }
 
-        output = chunk_linear_attn(q, k, v)
+        output = chunk_linear_attn(q, k, v, chunk_size=1)
         output = (
             output.transpose(1, 2)
             .contiguous()[:, :seq_len, ...]
@@ -115,28 +115,41 @@ class SubGemmaModel(nn.Module):
             raise ValueError(
                 "Both the first and last indices in layer_idx must be odd."
             )
-        self.layers = nn.ModuleList([original_model.layers[i] for i in full_idx])
-        self.rope_embeddings = rope_embeddings
-        for idx, layer in enumerate(self.layers):
-            if idx % 2 == 0:
-                q_proj = layer.self_attn.q_proj
-                k_proj = layer.self_attn.k_proj
-                v_proj = layer.self_attn.v_proj
-                o_proj = layer.self_attn.o_proj
+        full_layers = []
+        for idx in full_idx:
+            if idx in layer_idx:
+                cur_layer = GemmaDecoderLayer(
+                    config=original_model.config,
+                    attention_type=original_model.config.attention_type[idx],
+                )
 
-                layer.self_attn = GemmaLinearAttention(
-                    hidden_size=layer.self_attn.hidden_size,
-                    num_heads=layer.self_attn.num_heads,
-                    num_kv_heads=layer.self_attn.num_kv_heads,
-                    head_dim=layer.self_attn.head_dim,
+                cur_attn = GemmaLinearAttention(
+                    hidden_size=original_model.layers[idx].self_attn.hidden_size,
+                    num_heads=original_model.layers[idx].self_attn.num_heads,
+                    num_kv_heads=original_model.layers[idx].self_attn.num_kv_heads,
+                    head_dim=original_model.layers[idx].self_attn.head_dim,
                     train_attn=True,
                 )
-                layer.self_attn.q_proj = q_proj
-                layer.self_attn.k_proj = k_proj
-                layer.self_attn.v_proj = v_proj
-                layer.self_attn.o_proj = o_proj
-                layer.self_attn.feature_map_q.requires_grad = True
-                layer.self_attn.feature_map_k.requires_grad = True
+                cur_attn.q_proj = original_model.layers[idx].self_attn.q_proj
+                cur_attn.k_proj = original_model.layers[idx].self_attn.k_proj
+                cur_attn.v_proj = original_model.layers[idx].self_attn.v_proj
+                cur_attn.o_proj = original_model.layers[idx].self_attn.o_proj
+                cur_layer.self_attn = cur_attn
+                cur_layer.mlp = original_model.layers[idx].mlp
+                cur_layer.input_layernorm = original_model.layers[idx].input_layernorm
+                cur_layer.pre_feedforward_layernorm = original_model.layers[
+                    idx
+                ].pre_feedforward_layernorm
+                cur_layer.post_feedforward_layernorm = original_model.layers[
+                    idx
+                ].post_feedforward_layernorm
+                cur_layer.post_attention_layernorm.weight.requires_grad = False
+                full_layers.append(cur_layer)
+            else:
+                full_layers.append(original_model.layers[idx])
+
+        self.layers = nn.ModuleList(full_layers)
+        self.rope_embeddings = rope_embeddings
 
     def forward_layer(self, layer, hidden_states, freqs_cis, mask):
         """

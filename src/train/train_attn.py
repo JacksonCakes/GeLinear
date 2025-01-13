@@ -35,14 +35,21 @@ def evaluate(
             with torch.no_grad():
                 outputs = model(input_ids, train_attn=True)
             outputs = outputs["all_outputs"]
-            outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
+
             for layer_name, tensors in attention_hook.captured_tensors.items():
                 hs = tensors["hidden_states"]
-            outputs_pred = feature_map_model(hs)["all_outputs"]
             batch_loss = 0.0
-            zipped_outputs = list(
-                zip(outputs["attn_scores"], outputs_pred["attn_scores_pred"])
-            )
+            outputs_pred = feature_map_model(hs)["all_outputs"]
+            outputs = [
+                item.detach()
+                for idx, item in enumerate(outputs["attn_scores"])
+                if idx in layer_idx
+            ]
+            assert len(outputs) == len(
+                outputs_pred["attn_scores_pred"]
+            ), "Inconsistent length between teacher and student"
+            total_loss = 0.0
+            zipped_outputs = list(zip(outputs, outputs_pred["attn_scores_pred"]))
             n_layers = len(zipped_outputs)
             for attn_scores, attn_scores_pred in zipped_outputs:
                 layer_loss = mse_loss(attn_scores_pred, attn_scores)
@@ -79,6 +86,7 @@ def train(
     feature_map_model,
     train_loader,
     val_loader,
+    layer_idx,
     device,
     config_params,
     attention_hook=None,
@@ -108,29 +116,38 @@ def train(
     step = 0
     lowest_val_loss = float("inf")
     n_batches_per_step = 64
+
     for epoch in range(num_epochs):
         total_train_loss = 0.0
-
+        # torch.cuda.memory._record_memory_history(enabled='all')
+        # with profile(
+        # activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        # record_shapes=True,       # record input shapes
+        # profile_memory=True       # record memory usage
+        # ) as prof:
         for batch in tqdm(
             train_loader, desc=f"Training Epoch {epoch+1}/{num_epochs}", unit="batch"
         ):
+            optimizer.zero_grad()
             step += 1
             input_ids = batch["input_ids"].to(device)
-            if input_ids.shape[1] == 1024:
-                continue
             with torch.no_grad():
                 outputs = model(input_ids, train_attn=True)
             outputs = outputs["all_outputs"]
-            outputs = {k: [v_i.detach() for v_i in v] for k, v in outputs.items()}
+
             for layer_name, tensors in attention_hook.captured_tensors.items():
                 hs = tensors["hidden_states"]
             outputs_pred = feature_map_model(hs)["all_outputs"]
-            optimizer.zero_grad()
-
+            outputs = [
+                item.detach()
+                for idx, item in enumerate(outputs["attn_scores"])
+                if idx in layer_idx
+            ]
+            assert len(outputs) == len(
+                outputs_pred["attn_scores_pred"]
+            ), "Inconsistent length between teacher and student"
             total_loss = 0.0
-            zipped_outputs = list(
-                zip(outputs["attn_scores"], outputs_pred["attn_scores_pred"])
-            )
+            zipped_outputs = list(zip(outputs, outputs_pred["attn_scores_pred"]))
             n_layers = len(zipped_outputs)
             for attn_scores, attn_scores_pred in zipped_outputs:
                 layer_loss = mse_loss(attn_scores_pred, attn_scores)
@@ -139,7 +156,7 @@ def train(
             total_loss = total_loss / n_layers * mse_factor
             total_loss.backward()
             optimizer.step()
-
+            # prof.step()
             total_train_loss += total_loss.item()
             del hs, outputs, outputs_pred, zipped_outputs, total_loss
             if step % n_batches_per_step == 0:
@@ -184,7 +201,13 @@ def train(
                 )
                 writer.add_scalar("Loss/Train", avg_train_loss_so_far, step + 1)
                 writer.add_scalar("LR", lr_scheduler.get_last_lr()[0], step + 1)
-
+    # prof.export_chrome_trace("trace.json")
+    # print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
+    # s = torch.cuda.memory._snapshot()
+    # from pickle import dump
+    # with open(f"snapshot.pickle", "wb") as f:
+    #     dump(s, f)
+    # torch.cuda.memory._record_memory_history(enabled=None)
     writer.close()
 
 
@@ -218,7 +241,7 @@ if __name__ == "__main__":
         strict=False,
     )
     model.eval()
-
+    # model = torch.compile(model)
     for name, param in model.named_parameters():
         param.requires_grad = False
 
@@ -227,7 +250,7 @@ if __name__ == "__main__":
         rope_embeddings=model.rope_embeddings,
         layer_idx=layer_idx,
     ).to(config_params["model"]["device"], dtype=model_dtype)
-
+    # feature_map_model = torch.compile(feature_map_model)
     for name, param in feature_map_model.named_parameters():
         if param.requires_grad:
             print(f"{name}: requires_grad = {param.requires_grad}")
@@ -264,6 +287,7 @@ if __name__ == "__main__":
         feature_map_model=feature_map_model,
         train_loader=train_loader,
         val_loader=val_loader,
+        layer_idx=layer_idx,
         device=config_params["model"]["device"],
         attention_hook=attention_hook,
         config_params=config_params,

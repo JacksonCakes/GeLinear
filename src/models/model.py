@@ -278,7 +278,6 @@ class GemmaModel(nn.Module):
             for k, v in outputs.items():
                 all_outputs.setdefault(k, [])
                 all_outputs[k].append(v)
-
         hidden_states = self.norm(hidden_states)
         return {"hidden_states": hidden_states, "all_outputs": all_outputs}
 
