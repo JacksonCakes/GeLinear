@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# Usage: ./run_training.sh config.yaml
 
 CONFIG_FILE="$1"
 
@@ -15,4 +14,4 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-python3 -m src.train.train_attn --config "$CONFIG_FILE"
+accelerate launch --config_file /home/jackson/LLM-LinAtt/default_config.yaml src/train/accelerate_train.py --config "$CONFIG_FILE"

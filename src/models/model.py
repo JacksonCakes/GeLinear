@@ -89,6 +89,7 @@ class GemmaAttention(nn.Module):
         # apply positional embedding.
         q = apply_rotary_emb(q, freqs_cis=freqs_cis)
         k = apply_rotary_emb(k, freqs_cis=freqs_cis)
+
         if self.num_kv_heads != self.num_heads:
             # GQA
             # [batch_size, seq_len, num_kv_heads, head_dim]
@@ -296,9 +297,9 @@ class GemmaForCausalLM(nn.Module):
 
         self.model = GemmaModel(config=config)
         self.rope_embeddings = RotaryEmbedding(
-            theta=config.rope_theta,
+            theta=config.rope_theta,  # replace with config.rope_theta
             head_dim=config.head_dim,
-            max_seq_len=self.max_seq_len,
+            max_seq_len=self.max_seq_len * 2,
         )
 
     def forward(
@@ -345,7 +346,6 @@ class GemmaForCausalLM(nn.Module):
         # greedy
         if temperatures is None:
             return torch.argmax(logits, dim=-1), logits
-
         # Apply temperature scaling.
         logits.div_(temperatures.unsqueeze(dim=1))
 
@@ -376,7 +376,7 @@ class GemmaForCausalLM(nn.Module):
         self,
         input_token_ids_tensor: torch.Tensor,
         output_len: int = 100,
-        temperature: Union[float, None] = 0,
+        temperature: Union[float, None] = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
         eos_token_id: int = 107,

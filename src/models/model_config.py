@@ -41,7 +41,7 @@ class GemmaConfig:
     dtype: str = "bfloat16"
     # Whether a quantized version of the model is used.
     quant: bool = False
-    rope_theta: int = 500000
+    rope_theta: int = 10000
     # The types of attention used in the layers of the model.
     attention_type: Optional[Sequence[str]] = None
     # The size of the sliding window used for local attention.

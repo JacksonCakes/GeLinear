@@ -15,7 +15,11 @@ def template_and_tokenize(sample, tokenizer, max_length=1024):
         {"role": "assistant", "content": response},
     ]
     input_ids = tokenizer.apply_chat_template(
-        prompt, tokenize=True, truncation=True, max_length=max_length
+        prompt,
+        tokenize=True,
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
     )
     attn_mask = [1] * len(input_ids)
     sample = {
@@ -38,7 +42,7 @@ def load_data(tokenizer, train_set, val_set, remove_columns, batch_size=1):
         num_proc=16,
     )
     collate_fn = DataCollatorForSeq2Seq(
-        tokenizer, label_pad_token_id=-100, return_tensors="pt", padding=False
+        tokenizer, label_pad_token_id=-100, return_tensors="pt", padding=True
     )
     train_data = DataLoader(
         train_set, shuffle=False, collate_fn=collate_fn, batch_size=batch_size
