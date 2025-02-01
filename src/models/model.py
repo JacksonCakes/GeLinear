@@ -1,11 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
 from src.models.rope import RotaryEmbedding, apply_rotary_emb
 from src.models.linear.feature_map import HedgehogFeatureMap
 from src.models.attentions import softmax_attention, quadratic_attention
 from typing import Union, Tuple, Iterator
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from cut_cross_entropy import linear_cross_entropy
 
 
 def create_casual_mask(seq_len, device):
@@ -254,6 +257,7 @@ class GemmaModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.start_checkpoint_idx = None
 
     def forward(
         self,
@@ -268,12 +272,19 @@ class GemmaModel(nn.Module):
         # See https://github.com/huggingface/transformers/pull/29402
         normalizer = torch.tensor(self.hidden_size**0.5, dtype=embeddings.dtype)
         hidden_states = embeddings * normalizer
-        for layer in self.layers:
-            outputs = layer(
-                hidden_states=hidden_states,
-                freqs_cis=freqs_cis,
-                mask=mask,
-            )
+
+        for idx, layer in enumerate(self.layers):
+            if self.start_checkpoint_idx and idx >= self.start_checkpoint_idx:
+                # apply gradient checkpointing
+                outputs = checkpoint(
+                    layer.forward, hidden_states, freqs_cis, mask, use_reentrant=False
+                )
+            else:
+                # print(f"Layer {idx} is not checkpointed")
+                with torch.no_grad():
+                    outputs = layer(
+                        hidden_states=hidden_states, freqs_cis=freqs_cis, mask=mask
+                    )
 
             hidden_states = outputs["hidden_states"]
             for k, v in outputs.items():
@@ -302,29 +313,64 @@ class GemmaForCausalLM(nn.Module):
             max_seq_len=self.max_seq_len * 2,
         )
 
-    def forward(
-        self,
-        input_ids,
-        tok_idx=None,
-        mask=None,
-        num_logits_to_keep=0,
-        train_attn=False,
-    ):
+    def set_start_checkpoint_idx(self):
+        for idx, layer in enumerate(self.model.layers):
+            if hasattr(layer.self_attn, "feature_map_q"):
+                if any(
+                    param.requires_grad
+                    for param in layer.self_attn.feature_map_q.parameters()
+                ):
+                    print(f"Setting start_checkpoint_idx to {idx}")
+                    self.model.start_checkpoint_idx = idx
+                    break
+
+    def compute_embedding(self, input_ids, tok_idx=None, mask=None):
+        """
+        Computes embeddings (hidden states) from the model.
+        """
         seq_len = input_ids.shape[1]
         freqs_cis = self.rope_embeddings(seq_len=seq_len, tok_idx=tok_idx)
         if mask is None:
             mask = create_casual_mask(seq_len, device=input_ids.device)
+
         outputs = self.model(
             input_ids=input_ids,
             freqs_cis=freqs_cis,
             mask=mask,
         )
-        hidden_states = outputs["hidden_states"]
+        return outputs
+
+    def get_classifier_weights(self):
+        """
+        Retrieves the classifier weights, which are tied to the embedding layer.
+        """
+        return self.model.embed_tokens.weight  # Shape: (vocab_size, hidden_size)
+
+    def forward(
+        self,
+        input_ids,
+        labels=None,
+        tok_idx=None,
+        mask=None,
+        num_logits_to_keep=0,
+        train_attn=False,
+        compute_loss=False,
+    ):
+        outputs = self.compute_embedding(input_ids, tok_idx, mask)
         if train_attn:
             return outputs
+        if compute_loss:
+            loss = linear_cross_entropy(
+                outputs["hidden_states"],
+                self.model.embed_tokens.weight,
+                labels,
+                shift=True,
+            )
+            return {"loss": loss}
         # equivalent to lm_head() but since its tied weights, we can just use F.linear
         logits = F.linear(
-            hidden_states[:, -num_logits_to_keep:, :], self.model.embed_tokens.weight
+            outputs["hidden_states"][:, -num_logits_to_keep:, :],
+            self.model.embed_tokens.weight,
         )
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
