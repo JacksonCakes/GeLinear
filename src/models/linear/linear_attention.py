@@ -6,6 +6,7 @@ from src.models.rope import apply_rotary_emb
 from src.models.linear.feature_map import HedgehogFeatureMap
 from src.models.model import GemmaDecoderLayer, GemmaModel, create_casual_mask
 from src.models.attentions import quadratic_attention, chunk_linear_attn
+from src.utils import extract_layer_idx_from_state_dict
 
 
 class GemmaLinearAttention(nn.Module):
@@ -110,7 +111,12 @@ class SubGemmaModel(nn.Module):
     def __init__(self, original_model: GemmaModel, rope_embeddings, layer_idx: list):
         super().__init__()
         self.embed_tokens = original_model.embed_tokens
-        full_idx = list(range(layer_idx[0], layer_idx[-1] + 1))
+        self.layer_idx = layer_idx
+        #  if we are not training from first block, add previous blocks layers
+        if layer_idx[0] != 1:
+            prev_trained_layers = list(range(1, layer_idx[0], 2))
+            layer_idx = prev_trained_layers + layer_idx
+        full_idx = list(range(1, layer_idx[-1] + 1))
         if layer_idx[0] % 2 == 0 or layer_idx[-1] % 2 == 0:
             raise ValueError(
                 "Both the first and last indices in layer_idx must be odd."
@@ -151,6 +157,28 @@ class SubGemmaModel(nn.Module):
         self.layers = nn.ModuleList(full_layers)
         self.rope_embeddings = rope_embeddings
 
+    def init_partial_weights(self, feature_maps_state_dict):
+        trained_layer = extract_layer_idx_from_state_dict(feature_maps_state_dict)
+        for idx in trained_layer[1::2]:
+            self.layers[idx].self_attn.feature_map_q.load_state_dict(
+                {
+                    "layer": feature_maps_state_dict["feature_map_model_state_dict"][
+                        f"layers.{idx}.self_attn.feature_map_q.layer"
+                    ]
+                }
+            )
+            self.layers[idx].self_attn.feature_map_k.load_state_dict(
+                {
+                    "layer": feature_maps_state_dict["feature_map_model_state_dict"][
+                        f"layers.{idx}.self_attn.feature_map_k.layer"
+                    ]
+                }
+            )
+            for param in self.layers[idx].self_attn.feature_map_q.parameters():
+                param.requires_grad = False
+            for param in self.layers[idx].self_attn.feature_map_k.parameters():
+                param.requires_grad = False
+
     def forward_layer(self, layer, hidden_states, freqs_cis, mask):
         """
         A wrapper that calls `layer(...)` and returns
@@ -174,7 +202,7 @@ class SubGemmaModel(nn.Module):
         if mask is None:
             mask = create_casual_mask(seq_len, device=hidden_states.device)
         for idx, layer in enumerate(self.layers):
-            if idx % 2 == 0:
+            if idx % 2 == 0 and idx + 1 in self.layer_idx:
                 # ----------------------------------------
                 # GRADIENT CHECKPOINTING
                 # Instead of:
@@ -198,6 +226,15 @@ class SubGemmaModel(nn.Module):
                     outputs["attn_scores_pred"] = attn_scores_pred
 
                 hidden_states = hidden_states_out
+            elif idx % 2 == 0:
+                outputs = layer(
+                    hidden_states=hidden_states,
+                    freqs_cis=freqs_cis,
+                    mask=mask,
+                )
+
+                hidden_states = outputs["hidden_states"]
+                outputs.pop("attn_scores_pred")
             else:
                 outputs = layer(
                     hidden_states=hidden_states,

@@ -19,6 +19,8 @@ from src.dataloaders.loader import load_data
 from src.models.linear.linear_attention import SubGemmaModel
 from src.train.attention_hooks import AttentionHook
 
+torch.backends.cuda.matmul.allow_tf32 = True
+
 
 def evaluate(
     accelerator,
@@ -67,11 +69,13 @@ def evaluate(
 
             batch_loss = (batch_loss / len(teacher_attn_scores)) * mse_factor
             del hs, outputs, outputs_pred, teacher_attn_scores, student_attn_scores
-            torch.cuda.empty_cache()
-            total_loss += accelerator.gather(batch_loss).sum().item()
-            num_batches += 1
+
+            gathered_batch_loss = accelerator.gather(batch_loss)
+            total_loss = gathered_batch_loss.sum().item()
+            num_batches += len(gathered_batch_loss)
     total_loss = total_loss / num_batches if num_batches > 0 else 0.0
     feature_map_model.train()
+    torch.cuda.empty_cache()
     return total_loss
 
 
@@ -169,6 +173,9 @@ def train(
                 ]
                 student_attn_scores = outputs_pred["attn_scores_pred"]
 
+                assert (
+                    len(teacher_attn_scores) == len(student_attn_scores)
+                ), f"Length mismatch between teacher: {len(teacher_attn_scores)} and student: {len(student_attn_scores)} attn scores"
                 loss = 0.0
                 for t_attn_scores, s_attn_scores in zip(
                     teacher_attn_scores, student_attn_scores
@@ -179,9 +186,6 @@ def train(
 
                 accelerator.backward(loss)
                 optimizer.step()
-
-                if step % 100 == 0:
-                    torch.cuda.empty_cache()
 
                 # step scheduler every n_batches_per_step
                 if step % n_batches_per_step == 0:
@@ -220,6 +224,7 @@ def train(
                             logging.info(f"New best validation loss: {val_loss:.3f}")
 
                 if step % save_interval == 0:
+                    torch.cuda.empty_cache()
                     avg_train_loss_so_far = total_train_loss / step
                     if accelerator.is_main_process:
                         save_checkpoint(
@@ -264,7 +269,17 @@ def main():
     dataset_path = config_params["data"]["dataset_path"]
     dataset_split = config_params["data"]["subset"]
     split_ratio = config_params["data"]["split_ratio"]
-    tokenizer_path = config_params["model"]["tokenizer_path"]
+    tokenizer_path = config_params["data"]["tokenizer_path"]
+    prev_feature_maps_checkpoint_dir = config_params["model"][
+        "prev_feature_maps_checkpoint_dir"
+    ]
+    model_config.num_hidden_layers = layer_idx[-1] + 1
+
+    feature_maps_state_dict = torch.load(
+        prev_feature_maps_checkpoint_dir,
+        weights_only=True,
+        map_location=accelerator.device,
+    )
     model = GemmaForCausalLM.from_pretrained(
         config=model_config,
         checkpoint_path=checkpoint_path,
@@ -283,6 +298,9 @@ def main():
         rope_embeddings=model.rope_embeddings,
         layer_idx=layer_idx,
     )
+    feature_map_model.init_partial_weights(
+        feature_maps_state_dict=feature_maps_state_dict
+    )
     feature_map_model = feature_map_model.to(dtype=model_dtype)
 
     # for debugging
@@ -291,9 +309,8 @@ def main():
             print(f"{name}: requires_grad = {param.requires_grad}")
 
     attention_hook = AttentionHook()
-    # hook the previous layer output before the distillation layer
-    # eg. if layer_idx = [3], then we hook the output of layer 2
-    layers_to_hook = [layer_idx[0] - 1]
+    # hook first layer output since both model first layer should be same
+    layers_to_hook = [0]
     attention_hook.register_hooks(model, layers_to_hook)
 
     dataset = load_dataset(dataset_path, split=dataset_split)

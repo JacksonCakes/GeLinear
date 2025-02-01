@@ -14,4 +14,4 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-accelerate launch --config_file /home/jackson/LLM-LinAtt/default_config.yaml src/train/accelerate_train.py --config "$CONFIG_FILE"
+accelerate launch --config_file /home/jackson/LLM-LinAtt/default_config.yaml src/train/train_attn.py --config "$CONFIG_FILE"

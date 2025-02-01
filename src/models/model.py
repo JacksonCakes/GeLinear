@@ -297,7 +297,7 @@ class GemmaForCausalLM(nn.Module):
 
         self.model = GemmaModel(config=config)
         self.rope_embeddings = RotaryEmbedding(
-            theta=config.rope_theta,  # replace with config.rope_theta
+            theta=config.rope_theta,
             head_dim=config.head_dim,
             max_seq_len=self.max_seq_len * 2,
         )

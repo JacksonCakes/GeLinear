@@ -5,6 +5,7 @@ from typing import Optional
 torch.manual_seed(42)  # For reproducibility
 
 
+@torch.compiler.disable()
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """Precomputes the frequency cis."""
 
@@ -15,6 +16,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     return freqs_cis
 
 
+@torch.compiler.disable()
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Applies the rotary embedding to the query and key tensors."""
     x_ = torch.view_as_complex(
